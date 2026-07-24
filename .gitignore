@@ -1,0 +1,5 @@
+.DS_Store
+.zshrc.local
+.secrets.sh
+*.local
+*.bak

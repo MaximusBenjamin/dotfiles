@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# ssh-newkey — manage SSH keys with a consistent name + a documented map of
+# which key belongs to which host (the ~/.ssh/config IS the documentation).
+#
+# Keys are named:  ~/.ssh/id_ed25519_<label>
+#
+# Commands:
+#   ssh-newkey new  <label> [hostname] [user]
+#       Generate a key. Adds key to agent/keychain and prints the public key.
+#       • hostname given  -> writes a ready-to-use Host block (ssh <label>)
+#       • hostname omitted-> records the key as UNMAPPED; map it later once the
+#                            VPS/server gives you its hostname & user.
+#
+#   ssh-newkey map  <label> <hostname> [user]
+#       Attach a host (or finish an unmapped key) so you can `ssh <label>`.
+#
+#   ssh-newkey list
+#       Show every id_ed25519_* key and where it points (or "unmapped").
+#
+# Examples:
+#   ssh-newkey new hetzner-vps           # make key, paste pubkey into VPS panel
+#   ssh-newkey map hetzner-vps 5.75.1.2 root
+#   ssh hetzner-vps
+
+set -euo pipefail
+
+SSH_DIR="$HOME/.ssh"
+CONFIG="$SSH_DIR/config"
+MARKER="# ---- generated key blocks below (managed by ssh-newkey) ----"
+
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_dim=$'\033[2m'; c_b=$'\033[1m'; c_z=$'\033[0m'
+die() { printf '%serror:%s %s\n' "$c_red" "$c_z" "$*" >&2; exit 1; }
+
+ensure_files() {
+    mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+    [ -f "$CONFIG" ] || { touch "$CONFIG"; chmod 600 "$CONFIG"; }
+    grep -qF "$MARKER" "$CONFIG" || printf '\n%s\n' "$MARKER" >> "$CONFIG"
+}
+
+check_label() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "label may only contain letters, digits, . _ -"
+}
+
+# append a configured Host block for an already-existing key
+write_host_block() {
+    local label="$1" hostname="$2" user="$3" keyfile="$SSH_DIR/id_ed25519_${label}"
+    grep -qE "^Host[[:space:]]+${label}\b" "$CONFIG" && die "Host '$label' already in $CONFIG"
+    {
+        echo ""
+        echo "# ---- ${label} (mapped $(date +%Y-%m-%d)) ----"
+        echo "Host ${label}"
+        echo "    HostName ${hostname}"
+        [ -n "$user" ] && echo "    User ${user}"
+        echo "    IdentityFile ${keyfile/#$HOME/~}"
+        echo "    IdentitiesOnly yes"
+    } >> "$CONFIG"
+    chmod 600 "$CONFIG"
+}
+
+cmd_new() {
+    [ $# -ge 1 ] || die "usage: ssh-newkey new <label> [hostname] [user]"
+    local label="$1" hostname="${2:-}" user="${3:-}"
+    check_label "$label"
+    ensure_files
+
+    local keyfile="$SSH_DIR/id_ed25519_${label}"
+    [ -e "$keyfile" ] && die "key already exists: $keyfile"
+
+    echo "Generating ed25519 key -> $keyfile"
+    ssh-keygen -t ed25519 -f "$keyfile" -C "${label}@$(hostname -s 2>/dev/null || echo local)"
+    chmod 600 "$keyfile"; chmod 644 "$keyfile.pub"
+    ssh-add --apple-use-keychain "$keyfile" 2>/dev/null || ssh-add "$keyfile" 2>/dev/null || true
+
+    if [ -n "$hostname" ]; then
+        write_host_block "$label" "$hostname" "$user"
+        printf '\n%s✓ key created and mapped%s  ->  %sssh %s%s\n' "$c_grn" "$c_z" "$c_b" "$label" "$c_z"
+    else
+        # record as unmapped so the key still has a documented home
+        {
+            echo ""
+            echo "# ---- ${label} (UNMAPPED — created $(date +%Y-%m-%d)) ----"
+            echo "# key: ${keyfile/#$HOME/~}"
+            echo "# Give the pubkey below to the server, then run:"
+            echo "#   ssh-newkey map ${label} <hostname> [user]"
+        } >> "$CONFIG"
+        chmod 600 "$CONFIG"
+        printf '\n%s✓ key created (unmapped)%s\n' "$c_grn" "$c_z"
+        printf '%sNext:%s give the pubkey to the server, then: %sssh-newkey map %s <hostname> [user]%s\n' \
+            "$c_b" "$c_z" "$c_b" "$label" "$c_z"
+    fi
+
+    echo "Public key:"
+    echo "------------------------------------------------------------"
+    cat "$keyfile.pub"
+    echo "------------------------------------------------------------"
+}
+
+cmd_map() {
+    [ $# -ge 2 ] || die "usage: ssh-newkey map <label> <hostname> [user]"
+    local label="$1" hostname="$2" user="${3:-}"
+    check_label "$label"
+    ensure_files
+
+    local keyfile="$SSH_DIR/id_ed25519_${label}"
+    [ -e "$keyfile" ] || die "no key found for '$label' ($keyfile). Run: ssh-newkey new $label"
+
+    # drop the UNMAPPED placeholder block for this label, if present
+    if grep -qE "^# ---- ${label} \(UNMAPPED" "$CONFIG"; then
+        awk -v lbl="$label" '
+            $0 ~ "^# ---- " lbl " \\(UNMAPPED" { skip=1; next }
+            skip && /^#/ { next }
+            skip && /^$/ { next }
+            { skip=0; print }
+        ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG" && chmod 600 "$CONFIG"
+    fi
+
+    write_host_block "$label" "$hostname" "$user"
+    printf '\n%s✓ mapped%s  ->  %sssh %s%s   (%s%s)\n' "$c_grn" "$c_z" "$c_b" "$label" "$c_z" "$hostname" "$c_z"
+    echo "Test with:  ssh -T $label   (or)  ssh $label"
+}
+
+cmd_list() {
+    printf '%-24s %s\n' "KEY (label)" "MAPPED TO"
+    printf '%-24s %s\n' "-----------" "---------"
+    shopt -s nullglob
+    for pub in "$SSH_DIR"/id_ed25519_*.pub; do
+        local base label host
+        base="${pub%.pub}"; label="${base#"$SSH_DIR"/id_ed25519_}"
+        if grep -qE "^Host[[:space:]]+${label}\b" "$CONFIG" 2>/dev/null; then
+            host=$(ssh -G "$label" 2>/dev/null | awk '/^hostname /{print $2; exit}')
+            printf '%-24s %s\n' "$label" "$host"
+        else
+            printf '%-24s %sunmapped — ssh-newkey map %s <host> [user]%s\n' "$label" "$c_dim" "$label" "$c_z"
+        fi
+    done
+    # the default personal key
+    [ -e "$SSH_DIR/id_ed25519.pub" ] && printf '%-24s %s\n' "(default) id_ed25519" "personal / github / wrds / tailscale"
+}
+
+# ---- dispatch ----
+sub="${1:-}"
+case "$sub" in
+    new)   shift; cmd_new  "$@" ;;
+    map)   shift; cmd_map  "$@" ;;
+    list)  shift; cmd_list "$@" ;;
+    "" )   die "usage: ssh-newkey {new|map|list} ...  (see top of script for help)" ;;
+    -h|--help) sed -n '2,30p' "$0" ;;
+    # backward-compatible shorthand: `ssh-newkey <label> [host] [user]` == `new`
+    *)     cmd_new "$@" ;;
+esac
