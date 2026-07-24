@@ -1,8 +1,7 @@
 #!/bin/zsh
 
 # Directory containing markdown files
-# VAULT_DIR="/Users/alex/library/Mobile Documents/iCloud~md~obsidian/Documents/ZazenCodes"
-VAULT_DIR="/Users/alex/obsidian/ZazenCodes"
+VAULT_DIR="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Maximus/vault"
 SOURCE_DIR="zettelkasten"
 DEST_DIR="notes"
 

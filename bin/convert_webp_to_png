@@ -1,4 +1,4 @@
-#!/Users/alex/virtualenvs/adhoc/bin/python
+#!/usr/bin/env python3
 
 from PIL import Image
 from pathlib import Path
